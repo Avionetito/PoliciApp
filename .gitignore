@@ -6,3 +6,9 @@ OCRPipeline/.cache
 OCRPipeline/.venv
 OCRPipeline/Output
 OCRPipeline/ocr.log
+
+#Firebase
+Firebase/.env
+Firebase/.firebase
+Firebase/node_modules
+Firebase/package-lock.json

@@ -1,28 +1,36 @@
 #!/usr/bin/env python3
-# Requires: pip install pdf2image pytesseract pillow opencv-python tqdm jsonlines
-
-
-# Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-# .\.venv\Scripts\activate.ps1
-
+# -*- coding: utf-8 -*-
+"""
+OCR pipeline para tests tipo-test de Policía.
+  • Extrae preguntas (sin respuesta) de las páginas normales
+  • Extrae las soluciones de la(s) página(s) finales
+  • Funde ambos en un único JSONL / CSV
+  • Cachea el OCR por página en .cache/  → re-ejecuciones mucho + rápidas
+"""
+from __future__ import annotations
 
 from pathlib import Path
-import re, csv, jsonlines, pytesseract, cv2, logging, numpy as np
-from pdf2image import convert_from_path
+import re, csv, logging, jsonlines
 from dataclasses import dataclass, asdict
-from tqdm import tqdm
+from typing import Optional, Dict, List
+
+import numpy as np
+import pytesseract, cv2
+from pdf2image import convert_from_path
 from PIL import Image, ImageOps
+from tqdm import tqdm
 
-# ---------- Config ----------
-SRC_DIR       = Path("../Data")          # PDFs originales
-CACHE_DIR     = Path(".cache")           # Texto OCR por página
-OUT_DIR       = Path("Output")           # JSONL / CSV
-DPI           = 200                      # reduce tamaño pero mantiene precisión
-TESS_CONFIG   = "--oem 3 --psm 4 -l spa" # español
-OUT_DIR.mkdir(exist_ok=True)
-CACHE_DIR.mkdir(exist_ok=True)
+# ────────────────────────────── Config ─────────────────────────────
 
-# ---------- Logging ----------
+SRC_DIR     = Path("../Data")      # PDFs de entrada
+CACHE_DIR   = Path(".cache")
+OUT_DIR     = Path("Output")
+DPI         = 200                  # 200 = suficiente precisión, RAM contenida
+TESS_CONFIG = "--oem 3 --psm 4 -l spa"
+
+for d in (CACHE_DIR, OUT_DIR):
+    d.mkdir(exist_ok=True)
+
 logging.basicConfig(
     filename="ocr.log",
     level=logging.INFO,
@@ -30,107 +38,125 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ---------- Dataclass ----------
+# ────────────────────────────── Modelo ─────────────────────────────
+
 @dataclass
 class Question:
     tema: str
     number: int
     text: str
-    options: list[str]      # a, b, c, d
-    answer: str             # "a" | "b" | "c" | "d"
+    options: List[str]              # [a, b, c, d]
+    answer: Optional[str] = None    # se completará al final
 
-# ---------- OCR prep ----------
+# ────────────────────── Pre-proceso imagen (sin cambios) ───────────
+
 def preprocess(pil_img: Image.Image) -> np.ndarray:
-    # Convertir a gris, autocontrast y binarizar (Otsu)
     gray = ImageOps.autocontrast(pil_img.convert("L"))
     arr  = np.array(gray)
-    if arr.shape[0] > 3500:       # escala ↓ si la página es enorme
+    if arr.shape[0] > 3500:
         scale = 3500 / arr.shape[0]
         arr   = cv2.resize(arr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
     _, th = cv2.threshold(arr, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     return th
 
-# ---------- Parsing ----------
+# ───────────────────── Regex de preguntas  (SIN “Respuesta correcta”) ──────────
 Q_REGEX = re.compile(
-    r"""                # ejemplo: 12. Texto ...  a) ... b) ... c) ... d) ... Respuesta correcta: a
-    (?P<num>\d{1,3})\s* [\.\)\-]\s*      # número + separador
-    (?P<q>.+?)             # cuerpo de la pregunta (lazy)
-    \s+a\)\s*(?P<a>.+?)    # opción a
-    \s+b\)\s*(?P<b>.+?)    # opción b
-    \s+c\)\s*(?P<c>.+?)    # opción c
-    \s+d\)\s*(?P<d>.+?)    # opción d
-    \s*Respuesta\s+correcta:\s*(?P<ans>[abcd]) # solución
+    r"""
+    (?P<num>\d{1,3})\s*[\.\-\)]\s*                 # 1-  /  1.  /  1)
+    (?P<q>.+?)\s+a\)\s*(?P<a>.+?)\s+b\)\s*(?P<b>.+?)
+    \s+c\)\s*(?P<c>.+?)\s+d\)\s*(?P<d>.+?)
+    (?=\s+\d{1,3}\s*[\.\-\)]|$)                   # look-ahead: siguiente nº o fin
     """,
-    flags=re.IGNORECASE | re.DOTALL | re.VERBOSE,
+    re.IGNORECASE | re.DOTALL | re.VERBOSE,
 )
 
-def parse_questions(raw: str, tema: str) -> list[Question]:
-    txt = re.sub(r"\s+", " ", raw.strip())  # normaliza espacios
-    qs  = []
-    for m in Q_REGEX.finditer(txt):
-        qs.append(
-            Question(
-                tema=tema,
-                number=int(m["num"]),
-                text=m["q"].strip(),
-                options=[m["a"].strip(), m["b"].strip(), m["c"].strip(), m["d"].strip()],
-                answer=m["ans"].lower(),
-            )
-        )
-    return qs
+# ───────── Regex de soluciones “nº: Letra”  (acepta ruido tipo “25:B_”) ───────
+ANS_REGEX = re.compile(r"(\d{1,3})\s*[:\-]\s*([ABCDabcd])")
 
-# ---------- Procesar PDF ----------
-def process_pdf(pdf_path: Path) -> list[Question]:
-    tema     = pdf_path.stem.split()[1]  # «Tema 36 Test.pdf» → “36”
+def parse_questions(raw: str, tema: str) -> List[Question]:
+    clean = re.sub(r"\s+", " ", raw.strip())
+    return [
+        Question(
+            tema=tema,
+            number=int(m["num"]),
+            text=m["q"].strip(),
+            options=[m["a"].strip(), m["b"].strip(), m["c"].strip(), m["d"].strip()],
+        )
+        for m in Q_REGEX.finditer(clean)
+    ]
+
+def parse_answers(raw: str) -> Dict[int, str]:
+    return {int(n): l.lower() for n, l in ANS_REGEX.findall(raw)}
+
+# ───────────────────────── Procesar un PDF ────────────────────────
+
+def process_pdf(pdf_path: Path) -> List[Question]:
+    tema = pdf_path.stem.split()[1]       # «Tema 36 Test.pdf» → “36”
+    q_by_num: Dict[int, Question] = {}
+    answers: Dict[int, str] = {}
+
+    pages = convert_from_path(pdf_path, dpi=DPI)
     pdf_cache = CACHE_DIR / pdf_path.stem
     pdf_cache.mkdir(exist_ok=True)
 
-    questions = []
-    pages = convert_from_path(pdf_path, dpi=DPI)
     for idx, img in enumerate(pages, 1):
         cache_txt = pdf_cache / f"page_{idx:03d}.txt"
 
         if cache_txt.exists():
             raw = cache_txt.read_text(encoding="utf-8")
         else:
-            th  = preprocess(img)
-            raw = pytesseract.image_to_string(th, config=TESS_CONFIG)
+            raw = pytesseract.image_to_string(preprocess(img), config=TESS_CONFIG)
             cache_txt.write_text(raw, encoding="utf-8")
 
-        page_qs = parse_questions(raw, tema)
-        if page_qs:
-            log.info(f"{len(page_qs)} preguntas extraídas", extra={"pdf": pdf_path.name, "page": idx})
-            questions.extend(page_qs)
+        low = raw.lower()
+        if "solucion" in low:      # página de respuestas
+            new = parse_answers(raw)
+            answers.update(new)
+            log.info(f"{len(new)} soluciones", extra={"pdf": pdf_path.name, "page": idx})
+        else:                      # página de preguntas
+            qs = parse_questions(raw, tema)
+            for q in qs:
+                q_by_num[q.number] = q
+            log.info(f"{len(qs)} preguntas", extra={"pdf": pdf_path.name, "page": idx})
+
+    # --------- fusionar --------
+    for num, ans in answers.items():
+        if num in q_by_num:
+            q_by_num[num].answer = ans
         else:
-            log.warning("sin coincidencias", extra={"pdf": pdf_path.name, "page": idx})
+            log.warning(f"respuesta sin pregunta (nº {num})", extra={"pdf": pdf_path.name, "page": 0})
 
-    return questions
+    return list(q_by_num.values())
 
-# ---------- Main ----------
+# ────────────────────────── Main ──────────────────────────
+
 def main() -> None:
-    pdfs = list(SRC_DIR.glob("*.pdf"))
+    pdfs = sorted(SRC_DIR.glob("*.pdf"))
     if not pdfs:
         print(f"No hay PDFs en {SRC_DIR.resolve()}")
         return
 
-    all_qs: list[Question] = []
+    all_qs: List[Question] = []
     for pdf in tqdm(pdfs, desc="PDFs"):
         all_qs.extend(process_pdf(pdf))
 
-    # ---- Guardar ----
+    # guardar
     json_path = OUT_DIR / "questions.jsonl"
     csv_path  = OUT_DIR / "questions.csv"
 
-    with jsonlines.open(json_path, mode="w") as w:
+    with jsonlines.open(json_path, "w") as w:
         w.write_all(asdict(q) for q in all_qs)
 
     with csv_path.open("w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["tema", "number", "text", "a", "b", "c", "d", "answer"])
+        wr = csv.writer(f)
+        wr.writerow(["tema", "number", "text", "a", "b", "c", "d", "answer"])
         for q in all_qs:
-            w.writerow([q.tema, q.number, q.text, *q.options, q.answer])
+            wr.writerow([q.tema, q.number, q.text, *q.options, q.answer or ""])
 
-    print(f"✅ {len(all_qs)} preguntas guardadas → {json_path.relative_to(Path.cwd())}")
+    print(f"✅ {len(all_qs)} preguntas guardadas en {json_path.resolve()}")
+    faltan = [q.number for q in all_qs if q.answer is None]
+    if faltan:
+        print(f"⚠️  Sin respuesta (probable OCR en SOLUCIONES): {faltan}")
 
 if __name__ == "__main__":
     main()
