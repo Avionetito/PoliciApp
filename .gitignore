@@ -12,3 +12,4 @@ Firebase/.env
 Firebase/.firebase
 Firebase/node_modules
 Firebase/package-lock.json
+Firebase/service-account.json
