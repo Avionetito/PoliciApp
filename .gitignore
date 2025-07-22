@@ -1,0 +1,8 @@
+#Data
+Data
+
+#Ocr pipe
+OCRPipeline/.cache
+OCRPipeline/.venv
+OCRPipeline/Output
+OCRPipeline/ocr.log
